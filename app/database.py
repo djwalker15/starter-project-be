@@ -1,25 +1,23 @@
-# app/db.py
+# app/database.py
 from __future__ import annotations
 
 import urllib.parse
-from collections.abc import Generator
-from contextlib import contextmanager
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import QueuePool
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.config import get_settings
 
-# ---------------------------
-# Settings & URL construction
-# ---------------------------
-
 settings = get_settings()
 
-
-def _build_db_url_from_parts() -> str | None:
+def _build_async_db_url() -> str:
     user = settings.db_user
     pwd_raw = settings.db_password
     dbname = settings.db_name
@@ -30,129 +28,70 @@ def _build_db_url_from_parts() -> str | None:
     env = settings.env
 
     if not user or not pwd_raw or not dbname:
-        return None
+        raise RuntimeError("DB_USER, DB_PASSWORD, and DB_NAME must be set.")
 
-    if env == "local" and host and port:
-        pwd = urllib.parse.quote_plus(pwd_raw)
-        return f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{dbname}"
+    # URL-encode password
+    pwd = urllib.parse.quote_plus(pwd_raw)
 
+    # 1. Cloud SQL via Unix Socket (Production)
     if socket_dir and conn_name:
-        # postgresql+psycopg2://USER:ENC_PWD@/DBNAME?host=/cloudsql/PROJECT:REGION:INSTANCE
-        pwd = urllib.parse.quote_plus(pwd_raw)
+        # asyncpg connects via directory, not "host=..." query param for unix sockets usually,
+        # but SQLAlchemy handling varies.
+        # Common pattern: postgresql+asyncpg://user:pass@/dbname?host=/cloudsql/INSTANCE
         query = urllib.parse.urlencode({"host": f"{socket_dir.rstrip('/')}/{conn_name}"})
-        return f"postgresql+psycopg2://{user}:{pwd}@/{dbname}?{query}"
+        return f"postgresql+asyncpg://{user}:{pwd}@/{dbname}?{query}"
 
-    # if user and pwd_raw and dbname and host and port:
-    #     pwd = urllib.parse.quote_plus(pwd_raw)
-    #     return f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{dbname}"
-
-    # Nothing usable
-    return None
-
-
-def get_database_url() -> str:
-    built = _build_db_url_from_parts()
-    print(built)
-    if built:
-        return built
-    raise RuntimeError("Database URL not configured.")
+    # 2. TCP Connection (Local/Dev)
+    return f"postgresql+asyncpg://{user}:{pwd}@{host}:{port}/{dbname}"
 
 
 # ---------------
 # Engine & Session
 # ---------------
 
-_ENGINE: Engine | None = None
-_SessionLocal: sessionmaker | None = None
+_ASYNC_ENGINE: AsyncEngine | None = None
+_AsyncSessionLocal: async_sessionmaker[AsyncSession] | None = None
 
 
-def _create_engine() -> Engine:
-    url = get_database_url()
-    # Pool settings tuned for API usage; adjust as needed
-    engine = create_engine(
-        url,
-        poolclass=QueuePool,
-        pool_size=settings.db_pool_size,
-        max_overflow=settings.db_max_overflow,
-        pool_timeout=settings.db_pool_timeout,  # seconds
-        pool_pre_ping=True,  # validates connections from pool
-        future=True,
-    )
-
-    # Optional: set a statement timeout (ms) for all connections
-    stmt_timeout_ms = settings.db_statement_timeout_ms
-    if stmt_timeout_ms:
-        with engine.connect() as conn:
-            conn.execute(text(f"SET statement_timeout = {int(stmt_timeout_ms)}"))
-            conn.commit()
-
-    return engine
+def get_async_engine() -> AsyncEngine:
+    global _ASYNC_ENGINE, _AsyncSessionLocal
+    if _ASYNC_ENGINE is None:
+        url = _build_async_db_url()
+        _ASYNC_ENGINE = create_async_engine(
+            url,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_timeout=settings.db_pool_timeout,
+            pool_pre_ping=True,
+            echo=(settings.env == "local"),
+        )
+        _AsyncSessionLocal = async_sessionmaker(
+            bind=_ASYNC_ENGINE,
+            autoflush=False,
+            expire_on_commit=False,
+            future=True,
+        )
+    return _ASYNC_ENGINE
 
 
-def get_engine() -> Engine:
-    global _ENGINE, _SessionLocal
-    if _ENGINE is None:
-        _ENGINE = _create_engine()
-        _SessionLocal = sessionmaker(bind=_ENGINE, autoflush=False, autocommit=False, future=True)
-    return _ENGINE
-
-
-def get_sessionmaker() -> sessionmaker:
-    get_engine()  # ensures initialization
-    assert _SessionLocal is not None
-    return _SessionLocal
-
-
-@contextmanager
-def session_scope() -> Generator[Session, None, None]:
-    """
-    Context-managed session for scripts/background jobs:
-        with session_scope() as db:
-            ...
-    """
-    db = get_sessionmaker()()
-    try:
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-
-# -----------------------
-# FastAPI dependency hook
-# -----------------------
-
-
-def get_db() -> Generator[Session, None, None]:
-    """
-    FastAPI dependency:
-        @router.get("/items")
-        def list_items(db: Session = Depends(get_db)):
-            return db.execute(select(Item)).scalars().all()
-    """
-    db = get_sessionmaker()()
-    try:
-        yield db
-    finally:
-        db.close()
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency for DB session."""
+    get_async_engine()  # Ensure initialized
+    assert _AsyncSessionLocal is not None
+    async with _AsyncSessionLocal() as session:
+        yield session
 
 
 # -------------
 # Health checks
 # -------------
 
-
-def ping() -> bool:
-    """
-    Lightweight connectivity check you can call in a health endpoint.
-    """
-    engine = get_engine()
+async def ping() -> bool:
+    """Lightweight connectivity check."""
+    engine = get_async_engine()
     try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
         return True
     except Exception:
         return False
