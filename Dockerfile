@@ -25,8 +25,12 @@ COPY --from=builder /app/requirements.txt .
 
 RUN pip install --no-cache-dir /wheels/*
 
+# --- Copy Application Code ---
 COPY app /app/app
-# COPY README.md /app/README.md  <-- Optional, usually not needed in prod
+
+# --- FIX: Copy Alembic Configuration & Migrations ---
+COPY alembic.ini /app/alembic.ini
+COPY alembic /app/alembic
 
 EXPOSE 8080
 
