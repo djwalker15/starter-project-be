@@ -88,6 +88,7 @@ jobs:
           # Add Cloud SQL attachment if provided
           if [[ -n "${CLOUDSQL_CONNECTION_NAME:-}" ]]; then
             EXTRA_FLAGS+=( --add-cloudsql-instances="${CLOUDSQL_CONNECTION_NAME}" )
+            EXTRA_FLAGS+=( --set-env-vars="CLOUDSQL_CONNECTION_NAME=${CLOUDSQL_CONNECTION_NAME}" )
           fi
 
           # Add non-secret env vars (KEY=VALUE,KEY2=VALUE2)
