@@ -11,6 +11,8 @@ on:
     branches: [ main ]
     paths:
       - "app/**"
+      - "alembic/**"
+      - "alembic.ini"
       - "Dockerfile"
       - "requirements.txt"
       - ".github/workflows/deploy.yml"
@@ -22,10 +24,7 @@ env:
   REPO: ${{ secrets.ARTIFACT_REPO }}
   IMAGE: ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.CLOUD_RUN_SERVICE }}:${{ github.sha }}
   CLOUDSQL_CONNECTION_NAME: ${{ secrets.CLOUDSQL_CONNECTION_NAME }}
-  # Plain (non-secret) envs as a comma-separated KEY=VALUE list
   GCP_ENV_VARIABLES: ${{ secrets.GCP_ENV_VARIABLES }}
-  # Secret Manager mappings as a comma-separated list:
-  # e.g., DB_PASSWORD=projects/$PROJECT_ID/secrets/db_password:latest,JWT_SECRET=jwt_secret:1
   GCP_SECRET_VARS: ${{ secrets.GCP_SECRET_VARS }}
 
 jobs:
@@ -34,12 +33,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write  # needed for WIF
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
 
-      # --- Auth via Workload Identity Federation ---
       - id: auth-wif
         uses: google-github-actions/auth@v2
         with:
@@ -54,15 +52,7 @@ jobs:
           gcloud config set project "$PROJECT_ID"
           gcloud config set run/region "$REGION"
 
-      - name: Ensure Artifact Registry repo exists
-        run: |
-          gcloud artifacts repositories describe "$REPO" --location="$REGION" \
-          || gcloud artifacts repositories create "$REPO" \
-               --repository-format=docker \
-               --location="$REGION" \
-               --description="Docker repo for $SERVICE"
-
-      - name: Configure Docker for Artifact Registry
+      - name: Configure Docker
         run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 
       - name: Build and Push
@@ -70,22 +60,12 @@ jobs:
           docker build -t "$IMAGE" .
           docker push "$IMAGE"
 
-      # --- NEW STEP: Run Migrations via Cloud Run Job ---
+      # --- Migration Job ---
       - name: Run DB Migrations
-        env:
-          PROJECT_ID: ${{ env.PROJECT_ID }}
-          REGION: ${{ env.REGION }}
-          SERVICE: ${{ env.SERVICE }}
-          IMAGE: ${{ env.IMAGE }}
-          CLOUDSQL_CONNECTION_NAME: ${{ env.CLOUDSQL_CONNECTION_NAME }}
-          GCP_ENV_VARIABLES: ${{ env.GCP_ENV_VARIABLES }}
-          GCP_SECRET_VARS: ${{ env.GCP_SECRET_VARS }}
         run: |
           JOB_NAME="${SERVICE}-migrator"
           
-          echo "Deploying migration job: $JOB_NAME"
-          
-          # Build flags for the job
+          # Build flags for the JOB (Must use --set-cloudsql-instances)
           EXTRA_FLAGS=()
           if [[ -n "${CLOUDSQL_CONNECTION_NAME:-}" ]]; then
             EXTRA_FLAGS+=( --set-cloudsql-instances="${CLOUDSQL_CONNECTION_NAME}" )
@@ -98,7 +78,7 @@ jobs:
             EXTRA_FLAGS+=( --set-secrets="${GCP_SECRET_VARS}" )
           fi
 
-          # Create or Update the Job
+          echo "Deploying migration job: $JOB_NAME"
           gcloud run jobs deploy "$JOB_NAME" \
             --image="$IMAGE" \
             --region="$REGION" \
@@ -107,39 +87,24 @@ jobs:
             --max-retries=0 \
             "${EXTRA_FLAGS[@]}"
 
-          # Execute and wait for completion
           echo "Executing migration job..."
           gcloud run jobs execute "$JOB_NAME" --region="$REGION" --wait
 
-      # --- End Migration Step ---
-
-      - name: Deploy to Cloud Run (with Secret Manager + plain envs)
-        env:
-          PROJECT_ID: ${{ env.PROJECT_ID }}
-          REGION: ${{ env.REGION }}
-          SERVICE: ${{ env.SERVICE }}
-          IMAGE: ${{ env.IMAGE }}
-          CLOUDSQL_CONNECTION_NAME: ${{ env.CLOUDSQL_CONNECTION_NAME }}
-          GCP_ENV_VARIABLES: ${{ env.GCP_ENV_VARIABLES }}
-          GCP_SECRET_VARS: ${{ env.GCP_SECRET_VARS }}
+      # --- Service Deployment ---
+      - name: Deploy to Cloud Run
         run: |
           set -euo pipefail
 
-          # Build optional flags safely
+          # Build flags for the SERVICE (Can use --add-cloudsql-instances)
           EXTRA_FLAGS=()
-
-          # Add Cloud SQL attachment if provided
           if [[ -n "${CLOUDSQL_CONNECTION_NAME:-}" ]]; then
             EXTRA_FLAGS+=( --add-cloudsql-instances="${CLOUDSQL_CONNECTION_NAME}" )
+            # CRITICAL FIX: Pass the connection name as an Env Var to the app
             EXTRA_FLAGS+=( --set-env-vars="CLOUDSQL_CONNECTION_NAME=${CLOUDSQL_CONNECTION_NAME}" )
           fi
-
-          # Add non-secret env vars (KEY=VALUE,KEY2=VALUE2)
           if [[ -n "${GCP_ENV_VARIABLES:-}" ]]; then
             EXTRA_FLAGS+=( --set-env-vars="${GCP_ENV_VARIABLES}" )
           fi
-
-          # Add Secret Manager envs (ENV=SECRET[:VERSION],ENV2=projects/ID/secrets/NAME:VERSION,...)
           if [[ -n "${GCP_SECRET_VARS:-}" ]]; then
             EXTRA_FLAGS+=( --set-secrets="${GCP_SECRET_VARS}" )
           fi
