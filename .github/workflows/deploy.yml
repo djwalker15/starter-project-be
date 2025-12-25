@@ -70,6 +70,49 @@ jobs:
           docker build -t "$IMAGE" .
           docker push "$IMAGE"
 
+      # --- NEW STEP: Run Migrations via Cloud Run Job ---
+      - name: Run DB Migrations
+        env:
+          PROJECT_ID: ${{ env.PROJECT_ID }}
+          REGION: ${{ env.REGION }}
+          SERVICE: ${{ env.SERVICE }}
+          IMAGE: ${{ env.IMAGE }}
+          CLOUDSQL_CONNECTION_NAME: ${{ env.CLOUDSQL_CONNECTION_NAME }}
+          GCP_ENV_VARIABLES: ${{ env.GCP_ENV_VARIABLES }}
+          GCP_SECRET_VARS: ${{ env.GCP_SECRET_VARS }}
+        run: |
+          JOB_NAME="${SERVICE}-migrator"
+          
+          echo "Deploying migration job: $JOB_NAME"
+          
+          # Build flags for the job
+          EXTRA_FLAGS=()
+          if [[ -n "${CLOUDSQL_CONNECTION_NAME:-}" ]]; then
+            EXTRA_FLAGS+=( --add-cloudsql-instances="${CLOUDSQL_CONNECTION_NAME}" )
+            EXTRA_FLAGS+=( --set-env-vars="CLOUDSQL_CONNECTION_NAME=${CLOUDSQL_CONNECTION_NAME}" )
+          fi
+          if [[ -n "${GCP_ENV_VARIABLES:-}" ]]; then
+            EXTRA_FLAGS+=( --set-env-vars="${GCP_ENV_VARIABLES}" )
+          fi
+          if [[ -n "${GCP_SECRET_VARS:-}" ]]; then
+            EXTRA_FLAGS+=( --set-secrets="${GCP_SECRET_VARS}" )
+          fi
+
+          # Create or Update the Job
+          gcloud run jobs deploy "$JOB_NAME" \
+            --image="$IMAGE" \
+            --region="$REGION" \
+            --command="alembic" \
+            --args="upgrade,head" \
+            --max-retries=0 \
+            "${EXTRA_FLAGS[@]}"
+
+          # Execute and wait for completion
+          echo "Executing migration job..."
+          gcloud run jobs execute "$JOB_NAME" --region="$REGION" --wait
+
+      # --- End Migration Step ---
+
       - name: Deploy to Cloud Run (with Secret Manager + plain envs)
         env:
           PROJECT_ID: ${{ env.PROJECT_ID }}
