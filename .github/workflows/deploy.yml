@@ -88,7 +88,7 @@ jobs:
           # Build flags for the job
           EXTRA_FLAGS=()
           if [[ -n "${CLOUDSQL_CONNECTION_NAME:-}" ]]; then
-            EXTRA_FLAGS+=( --add-cloudsql-instances="${CLOUDSQL_CONNECTION_NAME}" )
+            EXTRA_FLAGS+=( --set-cloudsql-instances="${CLOUDSQL_CONNECTION_NAME}" )
             EXTRA_FLAGS+=( --set-env-vars="CLOUDSQL_CONNECTION_NAME=${CLOUDSQL_CONNECTION_NAME}" )
           fi
           if [[ -n "${GCP_ENV_VARIABLES:-}" ]]; then
